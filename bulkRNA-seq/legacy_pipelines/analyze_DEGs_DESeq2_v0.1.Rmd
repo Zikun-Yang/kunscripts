@@ -1,0 +1,446 @@
+---
+title: "DESeq2"
+author: "Zikun Yang"
+date: "2025-06-19"
+output: html_document
+---
+
+```{r comments}
+if(FALSE){
+  dir.create("results/", recursive = TRUE)
+  rmarkdown::render("DESeq2.Rmd", output_file = "results/DEG_analysis_by_DESeq2.html")
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# DESeq2
+
+
+## 00. parameters
+
+```{r parameters}
+# clear the environment
+rm(list=ls(all=TRUE))
+dir.create("results/raw", recursive = TRUE)
+dir.create("results/filtered", recursive = TRUE)
+
+raw_count_file <- "count_data/salmon.merged.gene_counts.tsv"
+tpm_file <- "count_data/salmon.merged.gene_tpm.tsv"
+meta_info_file <- "meta_info.tsv"
+logFC_cutoff <- 2
+padj_cutoff <- 0.05
+mark_top_n_DEG <- 10
+minimum_ratio <- 0.50
+```
+
+
+## 01. config
+
+```{r load_packages}
+library(DESeq2)    |> suppressPackageStartupMessages()
+library(pheatmap)  |> suppressPackageStartupMessages()
+library(ggplot2)   |> suppressPackageStartupMessages()
+library(dplyr)     |> suppressPackageStartupMessages()
+library(ggrepel)   |> suppressPackageStartupMessages()
+
+#BiocManager::install(c("clusterProfiler", "org.Hs.eg.db"))
+library(clusterProfiler)       |> suppressPackageStartupMessages()
+library(org.Hs.eg.db)          |> suppressPackageStartupMessages()
+```
+
+
+## 02. load data and setting
+
+```{r load_data}
+# read count data
+countData <- as.data.frame(read.csv(raw_count_file, sep="\t", row.names = "gene_id"))
+countData <- countData[,-which(colnames(countData) == "gene_name")]
+tpmData <- as.data.frame(read.csv(tpm_file, sep = "\t", row.names = "gene_id"))
+tpmData <- tpmData[,-which(colnames(tpmData) == "gene_name")]
+countData$mean_tpm <- rowMeans(tpmData)
+
+# filter out genes that not express
+countData <- countData[countData$mean_tpm > 1,]
+countData <- countData[,-which(colnames(countData) == "mean_tpm")]
+
+# read meta data
+meta <- read.table(meta_info_file, header = T, row.names = 1, sep = "\t")
+meta[,1] <- as.factor(meta$Type)
+
+# check
+all(rownames(meta) %in% colnames(countData))
+all(rownames(meta) == colnames(countData))
+
+# transform into integer format
+countData <- as.matrix(countData)
+storage.mode(countData) <- "integer"
+
+# create dds data
+dds <-  DESeqDataSetFromMatrix(countData = countData, 
+                               colData = meta, 
+                               design = ~ Type)
+dim(dds)
+
+# filtering
+dds <- dds[rowSums(counts(dds)) > 1,]
+dim(dds)
+```
+
+
+## 03. DEGs identification
+
+```{r identify_degs}
+# get DEGs
+dep <- DESeq(dds)
+res <- results(dep)
+diff <- res
+diff <- na.omit(diff)  # remove missing values
+dim(diff)
+deg <- as.data.frame(diff)
+#deg$log2FoldChange <- -deg$log2FoldChange ## 对于log2FoldChange 列取负数
+
+# mark
+deg$change <- as.factor(ifelse(
+                  deg$padj < padj_cutoff & abs(deg$log2FoldChange) > logFC_cutoff,
+                  ifelse(deg$log2FoldChange > logFC_cutoff, 
+                           "UP", 
+                           "DOWN"),
+                  "NOT"))
+
+this_title <- paste0('Cutoff for logFC is ',round(logFC_cutoff, 3),
+                     '\nThe number of up gene is ',nrow(deg[deg$change =='UP',]) ,
+                     '\nThe number of down gene is ',nrow(deg[deg$change =='DOWN',]))
+
+deg <- na.omit(deg)
+
+max_log2FoldChange <- max(abs(deg$log2FoldChange))
+
+fig = ggplot(data = deg, aes(x = log2FoldChange,y = -log10(padj), color = change))+
+  geom_point(alpha = 0.4, size = 1, shape = 16) +
+  coord_cartesian(xlim = c(-max_log2FoldChange, max_log2FoldChange)) +
+  labs(x = "log2 fold change", y = "-log10 padjust") +
+  ggtitle(this_title) +
+  theme_bw(base_size = 20) +
+  theme(plot.title = element_text(size = 15,hjust = 0.5)) +
+  scale_color_manual(values=c('blue', 'black', 'red'))
+print(fig)
+ggsave(fig, filename = "results/volcano.pdf", height = 6, width = 7)
+
+```
+
+```{r add_gene_name}
+deg <- cbind(rownames(deg), deg)
+colnames(deg)[1] <- "gene_id"
+countData <- as.data.frame(read.csv(raw_count_file, sep="\t"))
+countData <- countData %>%
+              dplyr::select(gene_id, gene_name)
+deg <- left_join(deg, countData, by = "gene_id")
+```
+
+```{r show_deg_with_labels}
+# the genes you want to mark
+if(file.exists("highlight.txt")){
+  highlight_symbols <- read.csv("highlight.txt", header=F, stringsAsFactors=FALSE)
+  highlight_symbols_vector <- highlight_symbols[,1]
+}else{
+  highlight_symbols_vector <- c()
+}
+
+
+# the top n genes to mark
+mark_top_n_up_DEG <- deg %>%
+                        arrange(desc(log2FoldChange)) %>%
+                        slice_head(n = mark_top_n_DEG) %>%
+                        pull(gene_id)
+mark_top_n_down_DEG <- deg %>%
+                        arrange(log2FoldChange) %>%
+                        slice_head(n = mark_top_n_DEG) %>%
+                        pull(gene_id)
+highlight_symbols_vector = c(highlight_symbols_vector, 
+                             mark_top_n_up_DEG, 
+                             mark_top_n_down_DEG)
+
+deg_with_highlight <- deg
+deg_with_highlight$alpha <- ifelse(deg$gene_id %in% highlight_symbols_vector, 1, 0.3)
+deg_with_highlight$symbol <- ifelse(deg_with_highlight$alpha == 1, deg$gene_id, NA)
+
+fig = ggplot(deg_with_highlight, aes(x = log2FoldChange, y = -log10(padj), label = symbol)) +
+  geom_point(aes(color = change, alpha = alpha), size = 1, shape = 16) +
+  geom_text_repel(aes(label = symbol), na.rm = TRUE, size = 3, max.overlaps = 100) +
+  coord_cartesian(xlim = c(-max_log2FoldChange, max_log2FoldChange)) +
+  scale_alpha(range=c(0.3, 1)) +
+  scale_color_manual(values=c('blue', 'black', 'red')) +
+  labs(x="log2 fold change", y="-log10 padjust") +
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        axis.line = element_line())
+print(fig)
+
+ggsave(fig, filename = "results/volcano_with_highlight.pdf", height = 6, width = 7)
+```
+
+
+## 04. DEGs expression level analysis
+
+```{r analyze_deg_expression}
+
+tpmData <- as.data.frame(read.csv(tpm_file, sep = "\t", row.names = "gene_id"))
+tpmData <- tpmData[,-which(colnames(tpmData) == "gene_name")]
+tpmData$mean_tpm <- rowMeans(tpmData)
+tpmData_slice <- tpmData %>% 
+              dplyr::mutate(gene_id = rownames(tpmData)) %>%
+              dplyr::select(gene_id, mean_tpm)
+
+deg <- deg %>%
+        left_join(tpmData_slice, by = "gene_id")
+
+deg_backup <-deg
+deg_backup$change <- "all"
+
+data4plot = rbind(deg, deg_backup)
+fig = ggplot(data4plot, aes(x = change, y = mean_tpm, fill = change) ) +
+  geom_violin() +
+  ##geom_jitter(size = 1) +
+  coord_cartesian(ylim = c(NA, 1e2)) +
+  theme_bw()
+fig
+
+ggsave(fig, filename="results/raw/gene_expression_level_analysis.pdf", width = 8, height = 6)
+
+
+set.seed(42)
+# permutation test for up-regulated genes
+n_up <- sum(deg$change == "UP")
+mean_tpm_up <- mean(deg[deg$change == "UP", "mean_tpm"])
+
+n_perm <- 10000
+perm_mean_tpm <- replicate(n_perm, {
+    deg_sample <- deg_backup[sample(nrow(deg_backup), n_up), ]
+    mean(deg_sample$mean_tpm)
+})
+perm_df <- data.frame(mean_tpm = perm_mean_tpm)
+
+p_val <- nrow(as.data.frame(perm_df[perm_df$mean_tpm <= mean_tpm_up,])) / nrow(perm_df)
+if (is.na(p_val) || length(p_val) == 0) {
+  p_val <- 0
+}
+print(paste0("whether expression of up-regulated DEGs is lower than all: ", p_val))
+
+fig = ggplot(perm_df, aes(x = mean_tpm)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = mean_tpm_up, color = "red") +
+  labs(title = sprintf("Permutation distribution of mean TPM (Up, p = %f)", p_val),
+       x = "Mean TPM", y = "Count") +
+  theme_bw()
+fig
+ggsave(fig, filename="results/raw/permutation_test_of_up_DEG.pdf", width = 8, height = 6)
+
+# permutation test for down-regulated genes
+n_down <- sum(deg$change == "DOWN")
+mean_tpm_down <- mean(deg[deg$change == "DOWN", "mean_tpm"])
+
+n_perm <- 10000
+perm_mean_tpm <- replicate(n_perm, {
+    deg_sample <- deg_backup[sample(nrow(deg_backup), n_down), ]
+    mean(deg_sample$mean_tpm)
+})
+perm_df <- data.frame(mean_tpm = perm_mean_tpm)
+
+p_val <- nrow(as.data.frame(perm_df[perm_df$mean_tpm <= mean_tpm_down,])) / nrow(perm_df)
+if (is.na(p_val) || length(p_val) == 0) {
+  p_val <- 0
+}
+print(paste0("whether expression of down-regulated DEGs is lower than all: ", p_val))
+
+fig = ggplot(perm_df, aes(x = mean_tpm)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = mean_tpm_down, color = "red") +
+  labs(title = sprintf("Permutation distribution of mean TPM (Down, p = %f)", p_val),
+       x = "Mean TPM", y = "Count") +
+  theme_bw()
+fig
+ggsave(fig, filename="results/raw/permutation_test_of_down_DEG.pdf", width = 8, height = 6)
+
+```
+
+save to table
+```{r save_raw_data}
+write.table(deg, 
+            file = "results/raw/raw_deg_data.tsv", 
+            sep = "\t",
+            row.names = FALSE)
+```
+
+
+## 05. GO enrichment analysis
+
+```{r GO_analysis}
+# UP-regulated genes
+gene_symbols <- deg[deg$change == "UP", "gene_name"]
+gene_entrez <- bitr(gene_symbols, 
+                    fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+missing_ratio <- (length(gene_symbols) - nrow(gene_entrez)) / length(gene_symbols) * 100
+ego <- enrichGO(gene         = gene_entrez$ENTREZID,
+                OrgDb        = org.Hs.eg.db,
+                keyType      = "ENTREZID",
+                ont          = "BP",       # Biological Process
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.01,
+                qvalueCutoff = 0.05,
+                readable     = TRUE)  
+fig = dotplot(ego, showCategory = 10) +
+  labs(title = sprintf("up-regulated DEGs (%.2f%% missing)", missing_ratio))
+fig
+ggsave(fig, filename="results/raw/up_GO_enrichment_dotplot.pdf", width = 8, height = 6, dpi = 300)
+
+# DOWN-regulated genes
+gene_symbols <- deg[deg$change == "DOWN", "gene_name"]
+gene_entrez <- bitr(gene_symbols, 
+                    fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+missing_ratio <- (length(gene_symbols) - nrow(gene_entrez)) / length(gene_symbols) * 100
+ego <- enrichGO(gene         = gene_entrez$ENTREZID,
+                OrgDb        = org.Hs.eg.db,
+                keyType      = "ENTREZID",
+                ont          = "BP",       # Biological Process
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.01,
+                qvalueCutoff = 0.05,
+                readable     = TRUE)  
+fig = dotplot(ego, showCategory = 10) +
+  labs(title = sprintf("down-regulated DEGs (%.2f%% missing)", missing_ratio))
+fig
+ggsave(fig, filename="results/raw/down_GO_enrichment_dotplot.pdf", width = 8, height = 6, dpi = 300)
+```
+
+
+## 06. filter low expression genes
+```{r filter_degs}
+minimum_tpm <- as.numeric(quantile(deg_backup$mean_tpm, probs = minimum_ratio, na.rm = TRUE))
+
+deg_filtered <- deg[deg$mean_tpm >= minimum_tpm,]
+
+raw_up_number <- nrow(deg[deg$change == "UP",])
+filtered_up_number <- nrow(deg_filtered[deg_filtered$change == "UP",])
+raw_down_number <- nrow(deg[deg$change == "DOWN",])
+filtered_down_number <- nrow(deg_filtered[deg_filtered$change == "DOWN",])
+
+sprintf("up-regulated genes: %d -> %d", raw_up_number, filtered_up_number)
+sprintf("down-regulated genes: %d -> %d", raw_down_number, filtered_down_number)
+
+```
+```{r save_filtered_data}
+write.table(deg_filtered, 
+            file = "results/filtered/filtered_deg_data.tsv", 
+            sep = "\t",
+            row.names = FALSE)
+```
+
+## 07. filtered DEGs expression level analysis
+
+```{r analyze_filtered_degs_expression}
+set.seed(42)
+# permutation test for up-regulated genes
+n_up <- sum(deg_filtered$change == "UP")
+mean_tpm_up <- mean(deg_filtered[deg_filtered$change == "UP", "mean_tpm"])
+
+n_perm <- 10000
+perm_mean_tpm <- replicate(n_perm, {
+    deg_sample <- deg_backup[sample(nrow(deg_backup), n_up), ]
+    mean(deg_sample$mean_tpm)
+})
+perm_df <- data.frame(mean_tpm = perm_mean_tpm)
+
+p_val <- nrow(as.data.frame(perm_df[perm_df$mean_tpm <= mean_tpm_up,])) / nrow(perm_df)
+if (is.na(p_val) || length(p_val) == 0) {
+  p_val <- 0
+}
+print(paste0("whether expression of up-regulated DEGs is lower than all: ", p_val))
+
+fig = ggplot(perm_df, aes(x = mean_tpm)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = mean_tpm_up, color = "red") +
+  labs(title = sprintf("Permutation distribution of mean TPM (Up, p = %f)", p_val),
+       x = "Mean TPM", y = "Count") +
+  theme_bw()
+fig
+ggsave(fig, filename="results/filtered/permutation_test_of_filtered_up_DEG.pdf", width = 8, height = 6)
+
+# permutation test for down-regulated genes
+n_down <- sum(deg_filtered$change == "DOWN")
+mean_tpm_down <- mean(deg_filtered[deg_filtered$change == "DOWN", "mean_tpm"])
+
+n_perm <- 10000
+perm_mean_tpm <- replicate(n_perm, {
+    deg_sample <- deg_backup[sample(nrow(deg_backup), n_down), ]
+    mean(deg_sample$mean_tpm)
+})
+perm_df <- data.frame(mean_tpm = perm_mean_tpm)
+
+p_val <- nrow(as.data.frame(perm_df[perm_df$mean_tpm <= mean_tpm_down,])) / nrow(perm_df)
+if (is.na(p_val) || length(p_val) == 0) {
+  p_val <- 0
+}
+print(paste0("whether expression of down-regulated DEGs is lower than all: ", p_val))
+
+fig = ggplot(perm_df, aes(x = mean_tpm)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = mean_tpm_down, color = "red") +
+  labs(title = sprintf("Permutation distribution of mean TPM (Down, p = %f)", p_val),
+       x = "Mean TPM", y = "Count") +
+  theme_bw()
+fig
+ggsave(fig, filename="results/filtered/permutation_test_of_filtered_down_DEG.pdf", width = 8, height = 6)
+
+```
+
+
+## 08. GO enrichment analysis
+
+```{r filtered_GO_analysis}
+# UP-regulated genes
+gene_symbols <- deg_filtered[deg_filtered$change == "UP", "gene_name"]
+gene_entrez <- bitr(gene_symbols, 
+                    fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+missing_ratio <- (length(gene_symbols) - nrow(gene_entrez)) / length(gene_symbols) * 100
+ego <- enrichGO(gene         = gene_entrez$ENTREZID,
+                OrgDb        = org.Hs.eg.db,
+                keyType      = "ENTREZID",
+                ont          = "BP",       # Biological Process
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.01,
+                qvalueCutoff = 0.05,
+                readable     = TRUE)  
+fig = dotplot(ego, showCategory = 10) +
+  labs(title = sprintf("up-regulated DEGs (%.2f%% missing)", missing_ratio))
+fig
+ggsave(fig, filename="results/filtered/up_GO_enrichment_dotplot.pdf", width = 8, height = 6, dpi = 300)
+
+# DOWN-regulated genes
+gene_symbols <- deg_filtered[deg_filtered$change == "DOWN", "gene_name"]
+gene_entrez <- bitr(gene_symbols, 
+                    fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+missing_ratio <- (length(gene_symbols) - nrow(gene_entrez)) / length(gene_symbols) * 100
+ego <- enrichGO(gene         = gene_entrez$ENTREZID,
+                OrgDb        = org.Hs.eg.db,
+                keyType      = "ENTREZID",
+                ont          = "BP",       # Biological Process
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.01,
+                qvalueCutoff = 0.05,
+                readable     = TRUE)  
+fig = dotplot(ego, showCategory = 10) +
+  labs(title = sprintf("down-regulated DEGs (%.2f%% missing)", missing_ratio))
+fig
+ggsave(fig, filename="results/filtered/down_GO_enrichment_dotplot.pdf", width = 8, height = 6, dpi = 300)
+```

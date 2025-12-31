@@ -1,0 +1,5 @@
+name: agat
+channels:
+  - conda-forge
+  - bioconda
+prefix: /home/zkyang/miniconda3/envs/agat

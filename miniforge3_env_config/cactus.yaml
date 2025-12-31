@@ -1,0 +1,5 @@
+name: cactus
+channels:
+  - conda-forge
+  - bioconda
+prefix: /home/zkyang/miniconda3/envs/cactus

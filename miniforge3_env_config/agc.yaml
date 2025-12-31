@@ -1,0 +1,7 @@
+name: agc
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - agc=3.2=h9ee0642_0
+prefix: /home/zkyang/miniconda3/envs/agc
